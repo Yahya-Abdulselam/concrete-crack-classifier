@@ -1,0 +1,10 @@
+tensorflow>=2.15
+opencv-python-headless>=4.9
+Pillow>=10.0
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+keras-tuner>=1.4
+gradio>=4.0
+numpy>=1.26
+psutil>=5.9

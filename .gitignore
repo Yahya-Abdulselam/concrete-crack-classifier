@@ -1,0 +1,46 @@
+# Datasets
+data/
+
+# Model outputs, logs, checkpoints
+outputs/
+*.keras
+*.h5
+*.pt
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.env.*
+venv/
+.venv/
+env/
+
+# Secrets & local config
+*.key
+*.pem
+
+# Claude Code
+CLAUDE.md
+CLAUDE.MD
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
