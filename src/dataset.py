@@ -1,5 +1,6 @@
-"""Dataset loading, splitting, and generator creation."""
+"""Dataset loading, splitting, balanced generator, and class weight computation."""
 
+import math
 import os
 import shutil
 from collections import defaultdict
@@ -7,6 +8,8 @@ from collections import defaultdict
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.utils import Sequence
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -202,11 +205,154 @@ def split_dataset(
     return dict(stats)
 
 
+class BalancedGenerator(Sequence):
+    """Training generator with x6-capped per-class balanced sampling.
+
+    Implements the rule:
+        TARGET_PER_CLASS = smallest_class_count x MAX_AUG_FACTOR
+
+    - The smallest class is seen exactly x6 per epoch (the safe cap)
+    - Larger classes are UNDERSAMPLED to the same target (seen <x6)
+    - On-the-fly augmentation (flip, rotate, shift, zoom, brightness)
+      is applied to every sample, so each pass is a different image
+    - Indices are reshuffled every epoch for maximum diversity
+    - Only ORIGINAL files are used (any 'aug_' prefixed files are ignored)
+    """
+
+    def __init__(
+        self,
+        split_dir: str = config.SPLIT_DIR,
+        batch_size: int = config.STAGE1_BATCH_SIZE,
+        seed: int = config.RANDOM_SEED,
+    ):
+        train_dir = os.path.join(split_dir, "train")
+        self.batch_size = batch_size
+        self.rng = np.random.RandomState(seed)
+
+        # Load ORIGINAL file paths per class (exclude any offline aug_ files)
+        self.class_files = {}
+        self.original_counts = {}
+        for cls_name in config.CLASS_NAMES:
+            cls_dir = os.path.join(train_dir, cls_name)
+            files = sorted([
+                os.path.join(cls_dir, f) for f in os.listdir(cls_dir)
+                if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+                and not f.startswith("aug_")
+            ])
+            self.class_files[cls_name] = files
+            self.original_counts[cls_name] = len(files)
+
+        # x6 cap rule: target = smallest_class x MAX_AUG_FACTOR
+        self.smallest_count = min(self.original_counts.values())
+        self.target_per_class = self.smallest_count * config.MAX_AUG_FACTOR
+
+        # Augmentation pipeline (same transforms as before, applied on-the-fly)
+        self.datagen = get_train_datagen()
+
+        # Build initial epoch indices and print config
+        self._build_epoch_indices()
+        self._print_config()
+
+    def _print_config(self):
+        """Print the balanced sampling configuration."""
+        total_original = sum(self.original_counts.values())
+        total_balanced = self.target_per_class * len(config.CLASS_NAMES)
+
+        print(f"\n{'='*70}")
+        print(f"BALANCED GENERATOR — x{config.MAX_AUG_FACTOR} CAP RULE")
+        print(f"{'='*70}")
+        print(f"  Smallest class:     {self.smallest_count:,} files")
+        print(f"  Target per class:   {self.target_per_class:,}"
+              f"  ({self.smallest_count:,} x {config.MAX_AUG_FACTOR})")
+        print(f"  Original files:     {total_original:,}")
+        print(f"  Balanced per epoch: {total_balanced:,}")
+        print()
+        print(f"  {'Class':<14} {'Original':>9} {'Per Epoch':>10} {'Multiplier':>11}")
+        print(f"  {'-'*48}")
+        for cls_name in config.CLASS_NAMES:
+            orig = self.original_counts[cls_name]
+            target = self.target_per_class
+            mult = target / orig if orig > 0 else 0
+            direction = "oversample" if mult > 1.0 else "undersample"
+            print(f"  {cls_name:<14} {orig:>9,} {target:>10,}"
+                  f"    x{mult:.1f} ({direction})")
+        print(f"  {'-'*48}")
+        print(f"  {'TOTAL':<14} {total_original:>9,} {total_balanced:>10,}")
+        print()
+        print(f"  No image is seen more than x{config.MAX_AUG_FACTOR} per epoch.")
+        print(f"  Each pass applies random augmentation (new image every time).")
+        print(f"  Val/test sets: NO augmentation, original distribution.")
+        print(f"{'='*70}")
+
+    def _build_epoch_indices(self):
+        """Build balanced list of (file_path, class_index) for one epoch.
+
+        - Classes with more files than target: randomly subsample (no replacement)
+        - Classes with fewer files than target: repeat up to x6 and truncate
+        """
+        indices = []
+        for cls_idx, cls_name in enumerate(config.CLASS_NAMES):
+            files = self.class_files[cls_name]
+            n = len(files)
+            target = self.target_per_class
+
+            if n >= target:
+                # Undersample: randomly pick 'target' files, no repeats
+                selected = list(self.rng.choice(files, size=target, replace=False))
+            else:
+                # Oversample: repeat file list and truncate to target
+                # ceil(target/n) <= MAX_AUG_FACTOR, so no file exceeds the cap
+                repeats = math.ceil(target / n)
+                pool = list(files) * repeats
+                self.rng.shuffle(pool)
+                selected = pool[:target]
+
+            indices.extend([(f, cls_idx) for f in selected])
+
+        self.rng.shuffle(indices)
+        self.indices = indices
+
+    def __len__(self):
+        return math.ceil(len(self.indices) / self.batch_size)
+
+    def __getitem__(self, idx):
+        batch = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+        X = np.zeros((len(batch), config.IMG_SIZE, config.IMG_SIZE, 3),
+                     dtype=np.float32)
+        y = np.zeros((len(batch), config.NUM_CLASSES), dtype=np.float32)
+
+        for i, (fpath, cls_idx) in enumerate(batch):
+            img = load_img(fpath, target_size=(config.IMG_SIZE, config.IMG_SIZE))
+            x = img_to_array(img)
+            x = self.datagen.random_transform(x)   # on-the-fly augmentation
+            x = self.datagen.standardize(x)         # preprocessing + normalization
+            X[i] = x
+            y[i, cls_idx] = 1.0
+
+        return X, y
+
+    def on_epoch_end(self):
+        """Reshuffle indices at the end of every epoch."""
+        self._build_epoch_indices()
+
+    @property
+    def samples(self):
+        """Total samples per epoch (target_per_class x num_classes)."""
+        return len(self.indices)
+
+    @property
+    def class_indices(self):
+        return {c: i for i, c in enumerate(config.CLASS_NAMES)}
+
+
 def get_generators(
     split_dir: str = config.SPLIT_DIR,
     batch_size: int = config.STAGE1_BATCH_SIZE,
 ) -> tuple:
     """Create data generators for train, validation, and test sets.
+
+    Training uses BalancedGenerator (x6 cap rule, online augmentation).
+    Validation and test use flow_from_directory (no augmentation).
 
     Args:
         split_dir: Directory containing train/val/test subfolders.
@@ -215,18 +361,9 @@ def get_generators(
     Returns:
         Tuple of (train_generator, val_generator, test_generator).
     """
-    train_datagen = get_train_datagen()
-    val_test_datagen = get_val_test_datagen()
+    train_gen = BalancedGenerator(split_dir, batch_size)
 
-    train_gen = train_datagen.flow_from_directory(
-        os.path.join(split_dir, "train"),
-        target_size=(config.IMG_SIZE, config.IMG_SIZE),
-        batch_size=batch_size,
-        class_mode="categorical",
-        classes=config.CLASS_NAMES,
-        shuffle=True,
-        seed=config.RANDOM_SEED,
-    )
+    val_test_datagen = get_val_test_datagen()
 
     val_gen = val_test_datagen.flow_from_directory(
         os.path.join(split_dir, "val"),
@@ -268,8 +405,10 @@ def compute_class_weights(split_dir: str = config.SPLIT_DIR) -> dict:
     for class_idx, class_name in enumerate(config.CLASS_NAMES):
         class_dir = os.path.join(train_dir, class_name)
         if os.path.isdir(class_dir):
+            # Count only ORIGINAL files (exclude any offline aug_ files)
             count = len([f for f in os.listdir(class_dir)
-                        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS])
+                        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+                        and not f.startswith("aug_")])
             labels.extend([class_idx] * count)
             class_counts[class_idx] = count
 
@@ -277,30 +416,25 @@ def compute_class_weights(split_dir: str = config.SPLIT_DIR) -> dict:
     weights = compute_class_weight("balanced", classes=np.unique(labels), y=labels)
     weight_dict = dict(enumerate(weights))
 
-    # Print detailed class distribution analysis
-    total_train = sum(class_counts.values())
-    max_count = max(class_counts.values())
-    print("\n" + "=" * 75)
-    print("CLASS DISTRIBUTION & BALANCING ANALYSIS (Training Set)")
-    print("=" * 75)
-    print(f"{'Class':<14} {'Files':>7} {'%':>7} {'Weight':>8} {'Effective':>10} {'Augment x':>10}")
-    print("-" * 75)
+    # Print class weights analysis
+    total_real = sum(class_counts.values())
+    target_per_class = min(class_counts.values()) * config.MAX_AUG_FACTOR
+    print(f"\n{'='*75}")
+    print("CLASS WEIGHTS (computed from ORIGINAL file counts)")
+    print(f"{'='*75}")
+    print(f"  {'Class':<14} {'Real Files':>10} {'%':>7} {'Weight':>8} {'Per Epoch':>10}")
+    print(f"  {'-'*55}")
     for idx, class_name in enumerate(config.CLASS_NAMES):
         count = class_counts.get(idx, 0)
-        pct = 100.0 * count / total_train if total_train else 0
+        pct = 100.0 * count / total_real if total_real else 0
         w = weight_dict.get(idx, 1.0)
-        effective = count * w
-        aug_factor = max_count / count if count > 0 else 0
-        print(f"  {class_name:<12} {count:>7,} {pct:>6.1f}% {w:>8.3f} {effective:>10,.1f} {aug_factor:>9.1f}x")
-    print("-" * 75)
-    print(f"  {'TOTAL':<12} {total_train:>7,}")
+        print(f"  {class_name:<12} {count:>10,} {pct:>6.1f}% {w:>8.3f} {target_per_class:>10,}")
+    print(f"  {'-'*55}")
+    print(f"  {'TOTAL':<14} {total_real:>10,}{'':>16} {target_per_class * len(class_counts):>10,}")
     print()
-    print("How balancing works:")
-    print("  - On-the-fly augmentation (flip, rotate, shift, zoom, brightness)")
-    print("    is applied UNIFORMLY to all classes each epoch.")
-    print("  - class_weight scales the LOSS: minority classes contribute more")
-    print("    gradient signal per sample, so the model learns them equally.")
-    print(f"  - Effective = Files x Weight (balanced target: ~{total_train / len(class_counts):,.0f} per class)")
-    print("=" * 75)
+    print("  Weights scale the LOSS: a misclassified minority image costs more")
+    print("  than a misclassified majority image. This works on top of the")
+    print(f"  x{config.MAX_AUG_FACTOR}-capped balanced sampling — both are always used together.")
+    print(f"{'='*75}")
 
     return weight_dict

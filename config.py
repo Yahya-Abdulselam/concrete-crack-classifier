@@ -61,6 +61,9 @@ L2_REG = 1e-4
 DENSE_UNITS_1 = 256
 DENSE_UNITS_2 = 128
 
+# === Augmentation Cap ===
+MAX_AUG_FACTOR = 6  # Max times any single image is seen per epoch (×6 cap rule)
+
 # === Augmentation Parameters ===
 ROTATION_RANGE = 15
 WIDTH_SHIFT = 0.10
