@@ -36,6 +36,24 @@ env/
 # Claude Code
 CLAUDE.md
 CLAUDE.MD
+.claude/
+
+# Editors / IDEs
+.vscode/
+.idea/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ML training artifacts
+runs/
+wandb/
+mlruns/
+lightning_logs/
 
 # OS
 .DS_Store

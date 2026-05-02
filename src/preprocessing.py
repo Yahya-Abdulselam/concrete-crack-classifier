@@ -1,22 +1,26 @@
-"""5-step image preprocessing pipeline for crack classification.
+"""Image preprocessing pipeline for crack classification (PyTorch).
 
 Steps:
 1. Load & force RGB
-2. Resize to 299x299 with LANCZOS
-3. Morphological filtering (3x3 elliptical kernel, open then close)
+2. Resize with LANCZOS
+3. Bilateral denoising (before CLAHE to avoid noise amplification)
 4. CLAHE on L channel in LAB space
-5. InceptionV3 normalization to [-1, 1]
+5. Normalization (ImageNet or [0,1] depending on model)
 """
 
 import numpy as np
 from PIL import Image
 import cv2
-from tensorflow.keras.applications.inception_v3 import preprocess_input
 
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+
+
+# ImageNet normalization constants
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def load_and_convert_rgb(image_path: str) -> Image.Image:
@@ -30,15 +34,18 @@ def resize_image(img: Image.Image, size: int = config.IMG_SIZE) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
-def morphological_filter(img_array: np.ndarray) -> np.ndarray:
-    """Step 3: Morphological filtering (open then close) with elliptical kernel."""
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (config.MORPH_KERNEL_SIZE, config.MORPH_KERNEL_SIZE),
+def bilateral_denoise(img_array: np.ndarray) -> np.ndarray:
+    """Step 3: Bilateral filter denoising before CLAHE.
+
+    Smooths homogeneous concrete regions while preserving crack edges.
+    Prevents CLAHE from amplifying sensor/texture noise.
+    """
+    return cv2.bilateralFilter(
+        img_array,
+        d=config.BILATERAL_DIAMETER,
+        sigmaColor=config.BILATERAL_SIGMA_COLOR,
+        sigmaSpace=config.BILATERAL_SIGMA_SPACE,
     )
-    filtered = cv2.morphologyEx(img_array, cv2.MORPH_OPEN, kernel)
-    filtered = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE, kernel)
-    return filtered
 
 
 def apply_clahe(img_array: np.ndarray) -> np.ndarray:
@@ -57,57 +64,80 @@ def apply_clahe(img_array: np.ndarray) -> np.ndarray:
     return rgb_enhanced
 
 
-def normalize_inception(img_array: np.ndarray) -> np.ndarray:
-    """Step 5: Normalize to [-1, 1] using InceptionV3 preprocessing."""
-    img_float = img_array.astype(np.float32)
-    return preprocess_input(img_float)
+def preprocess_numpy(image_path: str, size: int = config.IMG_SIZE) -> np.ndarray:
+    """Full numpy preprocessing: Load -> Resize -> Denoise -> CLAHE.
 
-
-def preprocess_image(image_path: str) -> np.ndarray:
-    """Full 5-step preprocessing pipeline.
-
-    Args:
-        image_path: Path to the input image.
-
-    Returns:
-        Preprocessed image array of shape (299, 299, 3) in [-1, 1] range.
+    Returns uint8 RGB array ready for torchvision transforms.
     """
     img = load_and_convert_rgb(image_path)
-    img = resize_image(img)
+    img = resize_image(img, size)
     img_array = np.array(img)
-    img_array = morphological_filter(img_array)
+    img_array = bilateral_denoise(img_array)
     img_array = apply_clahe(img_array)
-    img_array = normalize_inception(img_array)
     return img_array
 
 
-def preprocess_for_inference(image_path: str) -> np.ndarray:
+def preprocess_pil(image_path: str, size: int = config.IMG_SIZE) -> Image.Image:
+    """Full PIL preprocessing: Load -> Resize -> Denoise -> CLAHE.
+
+    Returns PIL Image ready for torchvision transforms.
+    """
+    img_array = preprocess_numpy(image_path, size)
+    return Image.fromarray(img_array)
+
+
+def preprocess_for_inference(
+    image_path: str,
+    size: int = config.IMG_SIZE,
+    normalize: str = "imagenet",
+):
     """Preprocess a single image for model inference.
 
     Args:
         image_path: Path to the input image.
+        size: Target size.
+        normalize: "imagenet" for pretrained models, "rescale" for CNN from scratch.
 
     Returns:
-        Preprocessed image array of shape (1, 299, 299, 3).
+        Tensor of shape (1, 3, size, size).
     """
-    img = preprocess_image(image_path)
-    return np.expand_dims(img, axis=0)
+    import torch
+    from torchvision import transforms
+
+    img = preprocess_pil(image_path, size)
+    transform_list = [
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+    ]
+    if normalize == "imagenet":
+        transform_list.append(
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        )
+    transform = transforms.Compose(transform_list)
+    tensor = transform(img)
+    return tensor.unsqueeze(0)
 
 
-def preprocessing_function_for_datagen(img_array: np.ndarray) -> np.ndarray:
-    """Preprocessing function compatible with ImageDataGenerator.
+def preprocess_for_svm(image_path: str, size: int = None) -> np.ndarray:
+    """Preprocess a single image for SVM feature extraction.
 
-    Applies steps 3-5 (morphology, CLAHE, normalization).
-    Steps 1-2 (load, resize) are handled by flow_from_directory.
+    Pipeline: load grayscale -> resize -> CLAHE on grayscale directly.
 
     Args:
-        img_array: Image array of shape (299, 299, 3), uint8.
+        image_path: Path to the input image.
+        size: Target size (default from config.SVM_IMG_SIZE).
 
     Returns:
-        Preprocessed image array in [-1, 1] range.
+        Preprocessed grayscale image array of shape (size, size), uint8.
     """
-    img_array = img_array.astype(np.uint8)
-    img_array = morphological_filter(img_array)
-    img_array = apply_clahe(img_array)
-    img_array = normalize_inception(img_array)
+    if size is None:
+        size = config.SVM_IMG_SIZE
+    img = Image.open(image_path).convert("L")
+    img = img.resize((size, size), Image.LANCZOS)
+    img_array = np.array(img)
+    clahe = cv2.createCLAHE(
+        clipLimit=config.CLAHE_CLIP_LIMIT,
+        tileGridSize=config.CLAHE_TILE_GRID,
+    )
+    img_array = clahe.apply(img_array)
     return img_array
